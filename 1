@@ -1,232 +1,643 @@
-import ccxt
 import time
+import datetime
+import threading
 import logging
-import winsound
-from datetime import datetime, timedelta
+import os
 import pandas as pd
 import numpy as np
-import asyncio
-import websockets
+from pybit.unified_trading import HTTP, WebSocket
+import traceback
 import json
+import winsound
+import ta
+import math
+from queue import Queue
+import requests
 
 # Настройка логирования
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__main__)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("trading_bot.log", encoding='utf-8'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
 
 class BybitTrader:
-    def __init__(self, api_key, api_secret, symbol, test=False, leverage=2, position_size=10, timezone_offset=0):
+    def __init__(self, api_key, api_secret, trade_symbol, interval="5", test=False, leverage=2, position_size=8, timezone_offset=2):
         self.api_key = api_key
         self.api_secret = api_secret
-        self.trade_symbol = symbol
-        self.test_mode = test
-        self.leverage = leverage
-        self.position_size = position_size
+        self.trade_symbol = trade_symbol
+        self.interval = interval
+        self.test = test
+        self.fixed_position_size = position_size
+        self.target_leverage = leverage
         self.timezone_offset = timezone_offset
-        self.session = ccxt.bybit({'apiKey': api_key, 'secret': api_secret, 'enableRateLimit': True})
-        if test:
-            self.session.options['defaultType'] = 'future'
-            self.session.set_sandbox_mode(True)
+        
+        # REST API и WebSocket
+        self.session = self._initialize_session()
+        self.ws_public = None
+        self.ws_private = None
         self.ws_connected = False
+        self.ws_queue = Queue()
         self.ws_message_count = 0
         self.ws_last_activity = None
+        
+        # Конфигурация стратегии
+        self.strategy_config = {
+            "support_level": 0.62,
+            "resistance_level": 0.68,
+            "rsi_period": 14,
+            "rsi_overbought": 70,
+            "rsi_oversold": 30,
+            "min_volume_threshold": 100000,
+            "sr_update_interval": 24,
+            "last_sr_update": None,
+            "max_risk_percent": 1.0,
+            "min_trade_interval": 5,
+            "min_position_hold_time": 15 * 60,
+            "max_position_hold_time": 6 * 60 * 60,
+            "strong_signal_threshold": 0.0005,
+            "stop_loss_percent": 1.5,  # Стоп-лосс 1.5%
+            "trailing_stop_percent": 0.5,
+            "take_profit_percent": 3.0,
+            "trailing_activation_percent": 0.1,  # Активация трейлинга при 0.1% прибыли
+            "use_direct_api": True,  # Настройка для прямого API запроса
+            "rsi_real_time_update": True,  # Обновление RSI в реальном времени
+        }
+        
+        # Переменные состояния
+        self.position = None
         self.running = False
-        self.candles = []
-        self.indicators = {}
-        self.position = {"size": 0, "side": "NONE"}
+        self.last_trade_time = None
+        self.position_open_time = None
+        self.trading_thread = None
+        self.ws_thread = None
+        self.price_data = pd.DataFrame()
         self.entry_price = None
         self.stop_loss = None
         self.take_profit = None
+        self.leverage = leverage
         self.peak_price = None
         self.trailing_active = False
-        self.position_open_time = None
-        self.last_trade_time = None
-        self.last_price = None
-        self.strategy_config = {
-            "stop_loss_percent": 1.5,
-            "take_profit_percent": 3.0,
-            "trailing_activation_percent": 0.1,  # Активация при 0.1%
-            "trailing_stop_percent": 0.5,
-            "min_position_hold_time": 300,
-            "max_position_hold_time": 3600,
-            "strong_signal_threshold": 0.0005
-        }
-
+        self.current_price = None
+        self.current_volume = 0
+        self.indicators = {}
+        self.last_price_check = 0
+        self.last_rsi_update = 0
+        
+        # Прямые API URL
+        self.bybit_public_api_url = "https://api.bybit.com/v5/market"
+        if self.test:
+            self.bybit_public_api_url = "https://api-testnet.bybit.com/v5/market"
+        
+        logger.info(f"Бот инициализирован: {trade_symbol}, Плечо: {leverage}x, Таймфрейм: {interval}M")
+    
     def get_local_time(self):
-        return datetime.now() + timedelta(hours=self.timezone_offset)
-
-    def start_trading(self):
+        """Возвращает локальное время с учетом часового пояса."""
+        return datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=self.timezone_offset)
+    
+    def _initialize_session(self):
+        """Инициализация REST-сессии Bybit."""
         try:
-            self.session.load_markets()
-            self.session.set_leverage(self.leverage, self.trade_symbol)
-            logger.info(f"Бот запущен для {self.trade_symbol}, плечо: {self.leverage}x")
-            self.running = True
-            asyncio.run(self._start_websocket())
+            session = HTTP(testnet=self.test, api_key=self.api_key, api_secret=self.api_secret)
+            logger.info(f"{'Тестовая' if self.test else 'Боевая'} сессия инициализирована")
+            return session
         except Exception as e:
-            logger.error(f"Ошибка запуска: {str(e)}")
-
-    def stop_trading(self):
-        self.running = False
-        self.ws_connected = False
-        logger.info("Бот остановлен")
-
-    async def _start_websocket(self):
-        uri = "wss://stream.bybit.com/v5/public/linear"
-        async with websockets.connect(uri) as websocket:
+            logger.error(f"Ошибка инициализации сессии: {str(e)}")
+            return None
+    
+    def _initialize_websocket(self):
+        """Инициализация WebSocket соединения."""
+        try:
+            logger.info("Инициализация WebSocket...")
+            self.ws_public = WebSocket(testnet=self.test, channel_type="linear")
+            self.ws_private = WebSocket(testnet=self.test, api_key=self.api_key, api_secret=self.api_secret, channel_type="private")
+            self.ws_message_count = 0
+            self.ws_last_activity = self.get_local_time()
+            
+            # Подписки на стримы
+            self.ws_public.orderbook_stream(callback=self._handle_orderbook, symbol=self.trade_symbol, depth=50)
+            self.ws_public.trade_stream(callback=self._handle_trade, symbol=self.trade_symbol)
+            self.ws_public.ticker_stream(callback=self._handle_ticker, symbol=self.trade_symbol)
+            self.ws_public.kline_stream(interval=self.interval, callback=self._handle_kline, symbol=self.trade_symbol)
+            self.ws_private.position_stream(callback=self._handle_position)
+            self.ws_private.execution_stream(callback=self._handle_execution)
+            
+            logger.info("WebSocket соединения установлены")
             self.ws_connected = True
-            self.ws_last_activity = self.get_local_time()
-            auth_message = {
-                "op": "subscribe",
-                "args": [f"kline.5m.{self.trade_symbol}", f"publicTrade.{self.trade_symbol}"]
-            }
-            await websocket.send(json.dumps(auth_message))
-            logger.info("WebSocket подключен")
-            while self.running:
-                try:
-                    message = await asyncio.wait_for(websocket.recv(), timeout=30.0)
-                    data = json.loads(message)
-                    if data.get('topic', '').startswith('kline'):
-                        self._handle_kline(data)
-                    elif data.get('topic', '').startswith('publicTrade'):
-                        self._handle_ticker(data)
-                    if not self.position["size"]:
-                        self.trading_logic()
-                except asyncio.TimeoutError:
-                    if (self.get_local_time() - self.ws_last_activity).total_seconds() > 60:
-                        logger.warning("Нет активности WebSocket, переподключение...")
-                        break
-                except Exception as e:
-                    logger.error(f"Ошибка WebSocket: {str(e)}")
-                    break
-
+            return True
+        except Exception as e:
+            logger.error(f"Ошибка инициализации WebSocket: {str(e)}")
+            self.ws_connected = False
+            return False
+    
+    def get_direct_ticker_price(self):
+        """Получение цены напрямую через REST API без использования библиотеки."""
+        try:
+            url = f"{self.bybit_public_api_url}/tickers"
+            params = {"category": "linear", "symbol": self.trade_symbol}
+            
+            response = requests.get(url, params=params, timeout=2)
+            
+            if response.status_code == 200:
+                data = response.json()
+                
+                if data and "retCode" in data and data["retCode"] == 0 and "result" in data and "list" in data["result"] and len(data["result"]["list"]) > 0:
+                    ticker_data = data["result"]["list"][0]
+                    
+                    last_price = float(ticker_data.get("lastPrice", 0))
+                    index_price = float(ticker_data.get("indexPrice", 0))
+                    mark_price = float(ticker_data.get("markPrice", 0))
+                    
+                    logger.debug(f"Direct API prices - Last: {last_price}, Index: {index_price}, Mark: {mark_price}")
+                    
+                    return last_price
+                else:
+                    logger.warning(f"Неожиданная структура ответа API: {data}")
+            else:
+                logger.warning(f"Ошибка API запроса: {response.status_code}, {response.text}")
+            
+            return None
+        except Exception as e:
+            logger.error(f"Ошибка прямого запроса цены: {str(e)}")
+            return None
+    
     def _handle_ticker(self, message):
+        """Обработка тикера."""
         try:
             self.ws_message_count += 1
             self.ws_last_activity = self.get_local_time()
-            ticker_data = message['data'][0]
-            if ticker_data['symbol'] == self.trade_symbol:
-                self.last_price = float(ticker_data['price'])
-                logger.debug(f"Обновлена цена из тикера: {self.last_price:.4f}")
+            
+            if 'data' in message and message['data']:
+                ticker_data = message['data']
+                if 'lastPrice' in ticker_data:
+                    new_price = float(ticker_data['lastPrice'])
+                    if self.current_price is None or abs(new_price - self.current_price) > 0.0001:
+                        logger.debug(f"Ticker обновление цены: {self.current_price} -> {new_price}")
+                    self.current_price = new_price
+                    
+                    # Обновляем RSI в реальном времени при получении новой цены
+                    if self.strategy_config.get("rsi_real_time_update", True):
+                        current_time = time.time()
+                        # Обновляем RSI не чаще чем раз в 2 секунды
+                        if current_time - self.last_rsi_update > 2:
+                            self._calculate_indicators()
+                            self.last_rsi_update = current_time
         except Exception as e:
-            logger.error(f"Ошибка обработки тикера: {str(e)}")
-
+            logger.error(f"Ошибка обработки ticker: {str(e)}")
+    
+    def _handle_orderbook(self, message):
+        """Обработка данных книги заказов."""
+        try:
+            self.ws_message_count += 1
+            self.ws_last_activity = self.get_local_time()
+            if 'data' in message and message['data']:
+                data = message['data']
+                if 'b' in data and 'a' in data and len(data['b']) > 0 and len(data['a']) > 0:
+                    new_price = (float(data['b'][0][0]) + float(data['a'][0][0])) / 2
+                    if self.current_price is None or abs(new_price - self.current_price) > 0.0002:
+                        logger.debug(f"Orderbook обновление цены: {self.current_price} -> {new_price}")
+                    self.current_price = new_price
+        except Exception as e:
+            logger.error(f"Ошибка обработки orderbook: {str(e)}")
+    
+    def _handle_trade(self, message):
+        """Обработка сделок."""
+        try:
+            self.ws_message_count += 1
+            self.ws_last_activity = self.get_local_time()
+            if 'data' in message and message['data'] and len(message['data']) > 0:
+                trade_data = message['data'][0]
+                if 'p' in trade_data and 'v' in trade_data:
+                    new_price = float(trade_data['p'])
+                    if self.current_price is None or abs(new_price - self.current_price) > 0.0001:
+                        logger.debug(f"Trade обновление цены: {self.current_price} -> {new_price}")
+                    self.current_price = new_price
+                    self.current_volume = float(trade_data['v'])
+        except Exception as e:
+            logger.error(f"Ошибка обработки trade: {str(e)}")
+    
     def _handle_kline(self, message):
+        """Обработка свечных данных."""
         try:
             self.ws_message_count += 1
             self.ws_last_activity = self.get_local_time()
-            kline_data = message['data'][0]
-            if kline_data['symbol'] == self.trade_symbol:
-                self.last_price = float(kline_data['close'])
-                logger.debug(f"Обновлена цена из свечи: {self.last_price:.4f}")
-                if kline_data['confirm']:
-                    candle = {
-                        'time': int(kline_data['start']) / 1000,
-                        'open': float(kline_data['open']),
-                        'high': float(kline_data['high']),
-                        'low': float(kline_data['low']),
-                        'close': float(kline_data['close']),
-                        'volume': float(kline_data['volume'])
-                    }
-                    self.candles.append(candle)
-                    if len(self.candles) > 100:
-                        self.candles.pop(0)
-                    logger.info(f"Новая свеча: O={candle['open']:.4f}, H={candle['high']:.4f}, L={candle['low']:.4f}, C={candle['close']:.4f}")
-                    self._calculate_indicators()
+            if 'data' in message and len(message['data']) > 0:
+                k_data = message['data'][0]
+                if k_data.get('confirm', False):
+                    try:
+                        new_candle = pd.DataFrame([{
+                            'start_time': pd.to_datetime(int(k_data['start']), unit='ms'),
+                            'open': float(k_data['open']),
+                            'high': float(k_data['high']),
+                            'low': float(k_data['low']),
+                            'close': float(k_data['close']),
+                            'volume': float(k_data['volume']),
+                            'turnover': float(k_data['turnover'])
+                        }])
+                        self.price_data = pd.concat([self.price_data, new_candle], ignore_index=True)
+                        # Пересчитываем RSI после получения новой свечи
+                        self._calculate_indicators()
+                        logger.info(f"Новая свеча: {k_data['close']}")
+                        
+                        self.current_price = float(k_data['close'])
+                    except Exception as e:
+                        logger.error(f"Ошибка при обработке свечных данных: {str(e)}\n{traceback.format_exc()}")
         except Exception as e:
-            logger.error(f"Ошибка обработки свечи: {str(e)}")
-
-    def _handle_execution(self, message):
+            logger.error(f"Ошибка обработки kline: {str(e)}")
+    
+    def _handle_position(self, message):
+        """Обработка данных о позиции."""
         try:
             self.ws_message_count += 1
             self.ws_last_activity = self.get_local_time()
-            execution_data = message['data'][0]
-            if execution_data['symbol'] == self.trade_symbol:
-                qty = execution_data.get('execQty', execution_data.get('qty', 'N/A'))
-                logger.info(f"Исполнение: {execution_data['side']} {qty} по {execution_data['price']}")
+            if 'data' in message and len(message['data']) > 0:
+                position_data = message['data'][0]
+                if position_data['symbol'] == self.trade_symbol:
+                    size = float(position_data.get('size', 0))
+                    if size > 0:
+                        self.position = {
+                            "size": size, 
+                            "side": position_data.get('side', 'NONE'),
+                            "entry_price": float(position_data.get('entryPrice', 0)),
+                            "unrealised_pnl": float(position_data.get('unrealisedPnl', 0))
+                        }
+                        self.entry_price = self.position["entry_price"]
+                    else:
+                        self.position = {"size": 0, "side": "NONE"}
+                    logger.info(f"Позиция обновлена: {self.position}")
+        except Exception as e:
+            logger.error(f"Ошибка обработки position: {str(e)}")
+    
+    def _handle_execution(self, message):
+        """Обработка исполнения ордеров."""
+        try:
+            self.ws_message_count += 1
+            self.ws_last_activity = self.get_local_time()
+            if 'data' in message and len(message['data']) > 0:
+                execution_data = message['data'][0]
+                if execution_data['symbol'] == self.trade_symbol and 'side' in execution_data and 'qty' in execution_data and 'price' in execution_data:
+                    logger.info(f"Исполнение: {execution_data['side']} {execution_data['qty']} по {execution_data['price']}")
         except Exception as e:
             logger.error(f"Ошибка обработки execution: {str(e)}")
-
-    def get_current_price(self):
+    
+    def set_leverage(self, leverage=None):
+        """Установка плеча."""
         try:
-            if self.ws_connected and hasattr(self, 'last_price') and self.last_price:
-                logger.debug(f"Текущая цена из WebSocket: {self.last_price:.4f}")
-                return self.last_price
-            else:
-                ticker = self.session.get_tickers(category="linear", symbol=self.trade_symbol)
-                price = float(ticker["result"]["list"][0]["lastPrice"])
-                logger.debug(f"Текущая цена из REST API: {price:.4f}")
-                self.last_price = price
-                return price
+            leverage = leverage or self.target_leverage
+            response = self.session.set_leverage(
+                category="linear", symbol=self.trade_symbol,
+                buyLeverage=str(leverage), sellLeverage=str(leverage)
+            )
+            self.leverage = leverage
+            logger.info(f"Плечо установлено: {leverage}x")
+            return True
         except Exception as e:
-            logger.error(f"Ошибка получения текущей цены: {str(e)}")
-            return self.entry_price if self.entry_price else 0.6475
-
+            logger.error(f"Ошибка установки плеча: {str(e)}")
+            return False
+    
+    def update_support_resistance_levels(self):
+        """Обновление уровней поддержки и сопротивления с улучшенным алгоритмом."""
+        try:
+            if self.price_data.empty or len(self.price_data) < 50:
+                return
+                
+            now = self.get_local_time()
+            if self.strategy_config["last_sr_update"] and (now - self.strategy_config["last_sr_update"]).total_seconds() < self.strategy_config["sr_update_interval"] * 3600:
+                return
+            
+            # Используем более глубокий анализ для определения уровней
+            data = self.price_data.tail(200).copy()  # Используем 200 свечей для лучшего анализа
+            
+            # Находим локальные минимумы и максимумы
+            window = 5  # Окно для определения локальных экстремумов
+            data['local_min'] = data['low'].rolling(window=window, center=True).min() == data['low']
+            data['local_max'] = data['high'].rolling(window=window, center=True).max() == data['high']
+            
+            # Фильтруем значимые уровни
+            support_points = data[data['local_min']]['low'].tolist()
+            resistance_points = data[data['local_max']]['high'].tolist()
+            
+            # Кластеризация близких уровней
+            cluster_threshold = 0.002  # 0.2% расстояние для кластеризации
+            
+            # Группировка уровней поддержки
+            support_clusters = []
+            for point in sorted(support_points):
+                added_to_cluster = False
+                for i, cluster in enumerate(support_clusters):
+                    if abs(point - sum(cluster) / len(cluster)) / point < cluster_threshold:
+                        support_clusters[i].append(point)
+                        added_to_cluster = True
+                        break
+                if not added_to_cluster:
+                    support_clusters.append([point])
+                    
+            # Группировка уровней сопротивления
+            resistance_clusters = []
+            for point in sorted(resistance_points):
+                added_to_cluster = False
+                for i, cluster in enumerate(resistance_clusters):
+                    if abs(point - sum(cluster) / len(cluster)) / point < cluster_threshold:
+                        resistance_clusters[i].append(point)
+                        added_to_cluster = True
+                        break
+                if not added_to_cluster:
+                    resistance_clusters.append([point])
+            
+            # Вычисляем средние значения для кластеров
+            supports = [sum(cluster) / len(cluster) for cluster in support_clusters]
+            resistances = [sum(cluster) / len(cluster) for cluster in resistance_clusters]
+            
+            # Если нашли уровни, используем наиболее сильные
+            if supports:
+                # Сортируем по частоте появления (сила уровня)
+                support_strengths = [(len(cluster), avg) for cluster, avg in zip(support_clusters, supports)]
+                strongest_support = sorted(support_strengths, key=lambda x: x[0], reverse=True)[0][1]
+                support = strongest_support
+            else:
+                # Запасной вариант - используем минимум
+                support = data['low'].min() * 1.01
+                
+            if resistances:
+                # Аналогично для сопротивления
+                resistance_strengths = [(len(cluster), avg) for cluster, avg in zip(resistance_clusters, resistances)]
+                strongest_resistance = sorted(resistance_strengths, key=lambda x: x[0], reverse=True)[0][1]
+                resistance = strongest_resistance
+            else:
+                resistance = data['high'].max() * 0.99
+                
+            # Проверка корректности уровней
+            if support >= resistance:
+                support = resistance * 0.99
+                
+            # Обновляем конфигурацию
+            self.strategy_config.update({
+                "support_level": support,
+                "resistance_level": resistance,
+                "last_sr_update": now
+            })
+            logger.info(f"Уровни обновлены: Поддержка={support:.4f}, Сопротивление={resistance:.4f}")
+        except Exception as e:
+            logger.error(f"Ошибка обновления уровней: {str(e)}\n{traceback.format_exc()}")
+    
+    def get_current_price(self):
+        """Получение текущей цены с приоритетом более надежного источника."""
+        try:
+            # Пробуем получить цену напрямую через REST API для максимальной точности
+            if self.strategy_config.get("use_direct_api", True):
+                direct_price = self.get_direct_ticker_price()
+                if direct_price:
+                    if self.current_price and abs(direct_price - self.current_price) > 0.0001:
+                        logger.info(f"Разница в цене: Direct API={direct_price}, WebSocket={self.current_price}")
+                    self.current_price = direct_price
+                    return direct_price
+            
+            # Если прямой API не сработал, используем стандартный метод через session
+            ticker = self.session.get_tickers(category="linear", symbol=self.trade_symbol)
+            if ticker and "result" in ticker and "list" in ticker["result"] and len(ticker["result"]["list"]) > 0:
+                rest_price = float(ticker["result"]["list"][0]["lastPrice"])
+                
+                if self.current_price and abs(rest_price - self.current_price) > 0.0001:
+                    logger.info(f"Разница в цене: REST API={rest_price}, WebSocket={self.current_price}")
+                
+                self.current_price = rest_price
+                return rest_price
+        except Exception as e:
+            logger.error(f"Ошибка получения цены через REST API: {str(e)}")
+        
+        # Если REST API не сработал, используем WebSocket цену
+        if self.ws_connected and self.current_price:
+            return self.current_price
+            
+        # Если все методы не сработали, возвращаем None
+        logger.warning("Не удалось получить текущую цену через все доступные методы")
+        return None
+    
+    def get_wallet_balance(self):
+        """Получение баланса кошелька."""
+        try:
+            balance = self.session.get_wallet_balance(accountType="UNIFIED", coin="USDT")
+            if balance and "result" in balance and "list" in balance["result"] and len(balance["result"]["list"]) > 0:
+                if "coin" in balance["result"]["list"][0] and len(balance["result"]["list"][0]["coin"]) > 0:
+                    return float(balance["result"]["list"][0]["coin"][0]["walletBalance"])
+            logger.warning("Не удалось получить баланс кошелька")
+            return None
+        except Exception as e:
+            logger.error(f"Ошибка получения баланса: {str(e)}")
+            return None
+    
+    def update_trailing_stop(self):
+        """Обновление трейлинг-стопа с порогом активации 0.1%."""
+        try:
+            if not self.position or self.position["size"] <= 0 or not self.entry_price:
+                return False
+            
+            # Получаем текущую цену
+            current_price = self.get_current_price()
+            if not current_price:
+                return False
+            
+            if not self.peak_price:
+                self.peak_price = self.entry_price
+            
+            # Использование активации в 0.1%
+            activation_percent = self.strategy_config["trailing_activation_percent"] / 100
+            
+            # Проверка условия активации трейлинга
+            if not self.trailing_active:
+                profit_percent = 0
+                if self.position["side"] == "Buy":
+                    profit_percent = (current_price - self.entry_price) / self.entry_price
+                else:  # Sell
+                    profit_percent = (self.entry_price - current_price) / self.entry_price
+                
+                # Активируем трейлинг, если прибыль достигла порога активации (0.1%)
+                if profit_percent >= activation_percent:
+                    self.trailing_active = True
+                    self.peak_price = current_price
+                    logger.info(f"Трейлинг-стоп активирован: прибыль {profit_percent*100:.2f}%")
+            
+            # Обновление трейлинг-стопа, если он активирован
+            if self.trailing_active:
+                # Обновляем пиковую цену
+                if (self.position["side"] == "Buy" and current_price > self.peak_price) or \
+                   (self.position["side"] == "Sell" and current_price < self.peak_price):
+                    self.peak_price = current_price
+                
+                trailing_percent = self.strategy_config["trailing_stop_percent"] / 100
+                
+                # Вычисляем новый уровень стоп-лосса
+                if self.position["side"] == "Buy":
+                    new_stop_loss = self.peak_price * (1 - trailing_percent)
+                    if new_stop_loss > self.stop_loss:
+                        self.update_stop_loss(new_stop_loss)
+                        logger.info(f"Трейлинг-стоп обновлен: {new_stop_loss:.6f}")
+                else:  # Sell
+                    new_stop_loss = self.peak_price * (1 + trailing_percent)
+                    if new_stop_loss < self.stop_loss:
+                        self.update_stop_loss(new_stop_loss)
+                        logger.info(f"Трейлинг-стоп обновлен: {new_stop_loss:.6f}")
+            
+            return True
+        except Exception as e:
+            logger.error(f"Ошибка трейлинг-стопа: {str(e)}")
+            return False
+    
+    def update_stop_loss(self, new_stop_loss):
+        """Обновление стоп-лосса."""
+        try:
+            response = self.session.set_trading_stop(category="linear", symbol=self.trade_symbol, stopLoss=str(new_stop_loss))
+            self.stop_loss = new_stop_loss
+            return response
+        except Exception as e:
+            logger.error(f"Ошибка обновления стоп-лосса: {str(e)}")
+            return None
+    
     def get_position(self):
+        """Получение текущей позиции."""
         if self.ws_connected and self.position:
             return self.position
         try:
             positions = self.session.get_positions(category="linear", symbol=self.trade_symbol)
-            position_data = positions["result"]["list"][0]
-            size = float(position_data.get("size", 0))
-            if size > 0:
-                self.position = {
-                    "size": size,
-                    "side": position_data.get("side", "NONE"),
-                    "entry_price": float(position_data.get("avgPrice", 0)),
-                    "unrealised_pnl": float(position_data.get("unrealisedPnl", 0)) if "unrealisedPnl" in position_data else 0.0
-                }
-                self.entry_price = self.position["entry_price"]
+            if positions and "result" in positions and "list" in positions["result"] and len(positions["result"]["list"]) > 0:
+                position_data = positions["result"]["list"][0]
+                size = float(position_data.get("size", 0))
+                if size > 0:
+                    self.position = {
+                        "size": size,
+                        "side": position_data.get("side", "NONE"),
+                        "entry_price": float(position_data.get("avgPrice", 0)),
+                        "unrealised_pnl": float(position_data.get("unrealisedPnl", 0))
+                    }
+                    self.entry_price = self.position["entry_price"]
+                else:
+                    self.position = {"size": 0, "side": "NONE"}
+                return self.position
             else:
+                logger.warning("Не удалось получить данные о позиции")
                 self.position = {"size": 0, "side": "NONE"}
-            return self.position
+                return self.position
         except Exception as e:
             logger.error(f"Ошибка получения позиции: {str(e)}")
             self.position = {"size": 0, "side": "NONE"}
             return self.position
-
-    def get_wallet_balance(self):
+    
+    def fetch_kline_data(self, limit=200):
+        """Загрузка исторических данных свечей."""
         try:
-            balance = self.session.get_wallet_balance(accountType="UNIFIED")
-            return float(balance["result"]["list"][0]["totalEquity"])
+            kline = self.session.get_kline(category="linear", symbol=self.trade_symbol, interval=self.interval, limit=limit)
+            if kline and "result" in kline and "list" in kline["result"]:
+                data_list = kline["result"]["list"]
+                if data_list:
+                    df = pd.DataFrame(data_list, columns=["start_time", "open", "high", "low", "close", "volume", "turnover"])
+                    df["start_time"] = pd.to_datetime(df["start_time"].astype(int), unit="ms")
+                    for col in ["open", "high", "low", "close", "volume", "turnover"]:
+                        df[col] = pd.to_numeric(df[col])
+                    self.price_data = df.sort_values("start_time")
+                    self._calculate_indicators()
+                    self.update_support_resistance_levels()
+                    logger.info(f"Загружено {len(df)} свечей")
+                    return df
+                else:
+                    logger.warning("Загружены пустые данные свечей")
+                    return pd.DataFrame()
+            else:
+                logger.warning("Не удалось загрузить данные свечей")
+                return pd.DataFrame()
         except Exception as e:
-            logger.error(f"Ошибка получения баланса: {str(e)}")
-            return None
-
+            logger.error(f"Ошибка загрузки свечей: {str(e)}")
+            return pd.DataFrame()
+    
     def calculate_position_size(self):
-        return self.position_size
-
-    def place_order(self, side, qty, stop_loss, take_profit, reason):
+        """Расчет размера позиции с учетом риска."""
         try:
+            current_price = self.get_current_price()
+            if not current_price:
+                current_price = 0.6432  # Значение по умолчанию
+            
+            # Минимальный размер позиции с учетом текущей цены
+            min_size = math.ceil(5.1 / current_price)
+            
+            # Получаем баланс кошелька
+            balance = self.get_wallet_balance()
+            if balance:
+                # Вычисляем максимально допустимый размер позиции в USDT
+                max_position_usdt = balance * (self.strategy_config["max_risk_percent"] / 100)
+                # Преобразуем в количество монет
+                risk_adjusted_size = math.ceil(max_position_usdt / current_price)
+                return max(risk_adjusted_size, min_size)
+            else:
+                logger.warning("Не удалось получить баланс, используется фиксированный размер позиции")
+                return max(self.fixed_position_size, min_size)
+        except Exception as e:
+            logger.error(f"Ошибка расчета размера позиции: {str(e)}")
+            return self.fixed_position_size
+    
+    def place_order(self, side, qty, stop_loss=None, take_profit=None, reason=""):
+        """Размещение ордера."""
+        try:
+            # Проверка минимального интервала между сделками
+            if self.last_trade_time and (self.get_local_time() - self.last_trade_time).total_seconds() < self.strategy_config["min_trade_interval"]:
+                logger.warning("Слишком частые сделки")
+                return None
+            
+            # Получение текущей цены
+            current_price = self.get_direct_ticker_price() or self.get_current_price()
+            if not current_price:
+                logger.warning("Не удалось получить текущую цену для размещения ордера")
+                return None
+            
+            # Формирование параметров ордера
             order_params = {
                 "category": "linear",
                 "symbol": self.trade_symbol,
                 "side": side,
                 "orderType": "Market",
-                "qty": str(int(qty)),
-                "stopLoss": str(round(stop_loss, 4)),
-                "takeProfit": str(round(take_profit, 4))
+                "qty": str(int(qty))
             }
+            
+            # Добавление стоп-лосса и тейк-профита при наличии
+            if stop_loss:
+                order_params["stopLoss"] = str(stop_loss)
+            if take_profit:
+                order_params["takeProfit"] = str(take_profit)
+            
+            # Размещение ордера
             response = self.session.place_order(**order_params)
-            self.position = {"size": qty, "side": side}
-            self.entry_price = self.get_current_price()
+            
+            # Обновление состояния
+            self.last_trade_time = self.position_open_time = self.get_local_time()
+            self.entry_price = current_price
+            self.peak_price = current_price
+            self.trailing_active = False
             self.stop_loss = stop_loss
             self.take_profit = take_profit
-            self.peak_price = None
-            self.trailing_active = False
-            self.position_open_time = self.get_local_time()
-            logger.info(f"Открыта {side} позиция: {qty} по {self.entry_price:.4f}, SL={stop_loss:.4f}, TP={take_profit:.4f}, Причина: {reason}")
+            
+            logger.info(f"Открыта {side} позиция: {qty} по {current_price}, SL={stop_loss}, TP={take_profit}, Причина: {reason}")
+            time.sleep(1)
+            self.get_position()
             winsound.Beep(1000, 500)
             return response
         except Exception as e:
-            logger.error(f"Ошибка открытия позиции: {str(e)}")
+            logger.error(f"Ошибка размещения ордера: {str(e)}")
             return None
-
+    
     def close_position(self):
+        """Закрытие позиции."""
         try:
             position = self.get_position()
             if position["size"] <= 0:
                 logger.info("Нет позиции для закрытия")
                 return None
+            
+            # Определение противоположной стороны для закрытия
             close_side = "Sell" if position["side"] == "Buy" else "Buy"
+            
+            # Формирование параметров ордера
             order_params = {
                 "category": "linear",
                 "symbol": self.trade_symbol,
@@ -235,10 +646,16 @@ class BybitTrader:
                 "qty": str(int(position["size"])),
                 "reduceOnly": True
             }
+            
+            # Размещение ордера закрытия
             response = self.session.place_order(**order_params)
+            
+            # Логирование результата
             pnl = position.get("unrealised_pnl", 0)
             balance = self.get_wallet_balance() or 0
-            logger.info(f"Закрыта {position['side']} позиция: PnL={pnl:.2f}, Баланс={balance:.2f}, Ответ: {response}")
+            logger.info(f"Закрыта {position['side']} позиция: PnL={pnl:.2f}, Баланс={balance:.2f}")
+            
+            # Сброс состояния
             self.position = {"size": 0, "side": "NONE"}
             self.entry_price = self.stop_loss = self.take_profit = self.peak_price = None
             self.trailing_active = False
@@ -249,169 +666,278 @@ class BybitTrader:
         except Exception as e:
             logger.error(f"Ошибка закрытия позиции: {str(e)}")
             return None
-
+    
     def _calculate_indicators(self):
-        if len(self.candles) < 14:
-            return
-        df = pd.DataFrame(self.candles)
-        df['rsi'] = self._calculate_rsi(df['close'], 14)
-        macd = self._calculate_macd(df['close'])
-        self.indicators = {
-            'rsi': df['rsi'].iloc[-1],
-            'macd': macd['macd'].iloc[-1],
-            'signal': macd['signal'].iloc[-1],
-            'macd_histogram': macd['histogram'].iloc[-1]
-        }
-
-    def _calculate_rsi(self, prices, period=14):
-        deltas = prices.diff()
-        gain = (deltas.where(deltas > 0, 0)).rolling(window=period).mean()
-        loss = (-deltas.where(deltas < 0, 0)).rolling(window=period).mean()
-        rs = gain / loss
-        return 100 - (100 / (1 + rs))
-
-    def _calculate_macd(self, prices, fast=12, slow=26, signal=9):
-        ema_fast = prices.ewm(span=fast, adjust=False).mean()
-        ema_slow = prices.ewm(span=slow, adjust=False).mean()
-        macd = ema_fast - ema_slow
-        signal_line = macd.ewm(span=signal, adjust=False).mean()
-        histogram = macd - signal_line
-        return pd.DataFrame({'macd': macd, 'signal': signal_line, 'histogram': histogram})
-
-    def detect_trend(self):
-        if len(self.candles) < 20:
-            return "unknown"
-        df = pd.DataFrame(self.candles)
-        sma_short = df['close'].rolling(window=5).mean().iloc[-1]
-        sma_long = df['close'].rolling(window=20).mean().iloc[-1]
-        return "uptrend" if sma_short > sma_long else "downtrend"
-
-    def check_momentum(self):
-        if 'macd_histogram' not in self.indicators:
-            return "unknown"
-        hist = self.indicators['macd_histogram']
-        return "bullish_momentum" if hist > 0 else "bearish_momentum"
-
-    def check_levels(self):
-        if len(self.candles) < 20:
-            return "unknown"
-        df = pd.DataFrame(self.candles)
-        recent_high = df['high'].rolling(window=20).max().iloc[-1]
-        recent_low = df['low'].rolling(window=20).min().iloc[-1]
-        current = df['close'].iloc[-1]
-        if current < recent_low * 1.01:
-            return "near_support"
-        elif current > recent_high * 0.99:
-            return "near_resistance"
-        return "mid_range"
-
-    def update_trailing_stop(self):
+        """Расчет RSI с текущей ценой для более точного значения."""
         try:
-            position = self.get_position()
-            if position["size"] == 0 or position["side"] == "NONE":
-                logger.info("Нет активной позиции для трейлинг-стопа")
+            if self.price_data.empty or len(self.price_data) < self.strategy_config["rsi_period"]:
+                logger.warning("Недостаточно данных для расчета индикаторов")
                 return
+            
+            # Создаем копию данных
+            df = self.price_data.copy()
+            
+            # Получаем последнюю цену
             current_price = self.get_current_price()
-            last_candle = self.candles[-1] if self.candles else None
-            if not self.entry_price or not self.stop_loss or not self.take_profit:
-                logger.error("Некорректные параметры позиции: entry_price, stop_loss или take_profit отсутствуют")
-                return
-            if self.peak_price is None:
-                self.peak_price = self.entry_price
-            if last_candle:
-                if position["side"] == "Buy":
-                    reference_price = last_candle['high']
-                elif position["side"] == "Sell":
-                    reference_price = last_candle['low']
-                logger.info(f"Используется OHLC: H={last_candle['high']:.4f}, L={last_candle['low']:.4f}, C={last_candle['close']:.4f}")
+            
+            # Если у нас есть текущая цена, создаем временный ряд с последней ценой
+            if current_price:
+                # Создаем новую строку с текущими данными
+                last_row = df.iloc[-1].copy()
+                last_time = last_row['start_time']
+                
+                # Добавляем новый временный тайм-фрейм с текущей ценой
+                temp_row = pd.DataFrame([{
+                    'start_time': last_time + pd.Timedelta(minutes=int(self.interval)),
+                    'open': last_row['close'],
+                    'high': max(last_row['close'], current_price),
+                    'low': min(last_row['close'], current_price),
+                    'close': current_price,
+                    'volume': 0,
+                    'turnover': 0
+                }])
+                
+                # Конкатенируем с основными данными для расчета
+                temp_df = pd.concat([df, temp_row], ignore_index=True)
+                
+                # Рассчитываем RSI с учетом текущей цены
+                temp_df['rsi'] = ta.momentum.rsi(close=temp_df['close'], window=self.strategy_config["rsi_period"])
+                
+                # Получаем актуальное значение RSI
+                rsi_value = temp_df['rsi'].iloc[-1]
+                
+                # Сохраняем в индикаторах
+                self.indicators['rsi'] = rsi_value
             else:
-                reference_price = current_price
-                logger.info("Свечи недоступны, используется текущая цена")
-            if position["side"] == "Buy":
-                self.peak_price = max(self.peak_price, reference_price)
-                profit_percent = (self.peak_price - self.entry_price) / self.entry_price * 100
-            elif position["side"] == "Sell":
-                self.peak_price = min(self.peak_price, reference_price)
-                profit_percent = (self.entry_price - self.peak_price) / self.entry_price * 100
-            logger.info(f"Трейлинг-стоп: RefPrice={reference_price:.4f}, Peak={self.peak_price:.4f}, Прибыль={profit_percent:.2f}%")
-            if not self.trailing_active and profit_percent >= self.strategy_config["trailing_activation_percent"]:
-                self.trailing_active = True
-                logger.info(f"Трейлинг-стоп активирован: Прибыль={profit_percent:.2f}%")
-            if self.trailing_active:
-                if position["side"] == "Buy":
-                    new_stop_loss = self.peak_price * (1 - self.strategy_config["trailing_stop_percent"] / 100)
-                    if new_stop_loss > self.stop_loss:
-                        self.stop_loss = new_stop_loss
-                        logger.info(f"Обновлен стоп-лосс для Buy: {self.stop_loss:.4f}")
-                elif position["side"] == "Sell":
-                    new_stop_loss = self.peak_price * (1 + self.strategy_config["trailing_stop_percent"] / 100)
-                    if new_stop_loss < self.stop_loss:
-                        self.stop_loss = new_stop_loss
-                        logger.info(f"Обновлен стоп-лосс для Sell: {self.stop_loss:.4f}")
-                if (position["side"] == "Buy" and current_price <= self.stop_loss) or \
-                   (position["side"] == "Sell" and current_price >= self.stop_loss):
-                    logger.info(f"Закрытие позиции по трейлинг-стопу: Цена={current_price:.4f}, SL={self.stop_loss:.4f}")
-                    self.close_position()
+                # Если нет текущей цены, считаем стандартно
+                df['rsi'] = ta.momentum.rsi(close=df['close'], window=self.strategy_config["rsi_period"])
+                self.indicators['rsi'] = df['rsi'].iloc[-1]
+                
+            # Логирование
+            logger.debug(f"Рассчитан RSI: {self.indicators['rsi']:.2f}")
         except Exception as e:
-            logger.error(f"Ошибка в update_trailing_stop: {str(e)}")
-
-    def trading_logic(self):
+            logger.error(f"Ошибка расчета индикаторов: {str(e)}\n{traceback.format_exc()}")
+    
+    def check_levels(self):
+        """Улучшенная проверка ключевых уровней с зонами приближения."""
         try:
-            if not self.ws_connected:
-                self._calculate_indicators()
+            current_price = self.get_current_price()
+            if not current_price:
+                return "no_key_level"
+            
+            # Получаем базовые уровни поддержки и сопротивления
+            base_support = self.strategy_config.get("support_level", 0)
+            base_resistance = self.strategy_config.get("resistance_level", 0)
+            
+            # Проверяем, что уровни установлены и имеют смысл
+            if base_support <= 0 or base_resistance <= 0 or base_support >= base_resistance:
+                return "no_key_level"
+            
+            # Создаем зоны вокруг уровней (1.5% от уровня)
+            zone_width = 0.015
+            
+            support_zone_upper = base_support * (1 + zone_width)
+            resistance_zone_lower = base_resistance * (1 - zone_width)
+            
+            # Определяем положение цены относительно зон
+            if current_price <= base_support:
+                return "at_support"  # Цена на уровне поддержки
+            elif current_price <= support_zone_upper:
+                return "near_support"  # Цена в зоне поддержки
+            elif current_price >= base_resistance:
+                return "at_resistance"  # Цена на уровне сопротивления
+            elif current_price >= resistance_zone_lower:
+                return "near_resistance"  # Цена в зоне сопротивления
+                
+            # Добавим определение середины диапазона
+            mid_point = (base_support + base_resistance) / 2
+            mid_zone_width = (base_resistance - base_support) * 0.1
+            
+            if abs(current_price - mid_point) <= mid_zone_width:
+                return "mid_range"  # Цена в середине диапазона
+                
+            # Определение позиции в первой или последней трети диапазона
+            lower_third = base_support + (base_resistance - base_support) / 3
+            upper_third = base_resistance - (base_resistance - base_support) / 3
+            
+            if current_price < lower_third:
+                return "lower_range"
+            elif current_price > upper_third:
+                return "upper_range"
+                
+            return "middle_range"  # Цена в средней части диапазона
+        except Exception as e:
+            logger.error(f"Ошибка проверки уровней: {str(e)}")
+            return "no_key_level"
+    
+    def trading_logic(self):
+        """Упрощенная торговая логика с использованием только RSI и уровней поддержки/сопротивления."""
+        try:
+            # Пересчитываем индикаторы перед принятием решения
+            self._calculate_indicators()
+            
+            # Получаем текущую позицию и рыночные параметры
             position = self.get_position()
-            trend = self.detect_trend()
-            momentum = self.check_momentum()
             level = self.check_levels()
-            current_price = self.get_current_price() or 0.6475
+            
+            # Принудительно получаем цену через прямой REST API для точности
+            current_price = self.get_direct_ticker_price() or self.get_current_price()
+            if not current_price:
+                current_price = 0.6432  # Значение по умолчанию
+                    
             rsi = self.indicators.get('rsi', 50)
-            macd_hist = self.indicators.get('macd_histogram', 0)
-            logger.info(f"Рынок: Тренд={trend}, Импульс={momentum}, Уровень={level}, Цена={current_price:.4f}, RSI={rsi:.2f}")
+            
+            logger.info(f"Рынок: Уровень={level}, Цена={current_price:.4f}, RSI={rsi:.2f}")
+            
+            # Управление открытой позицией
             if position["size"] > 0:
+                # Обновляем трейлинг-стоп
                 self.update_trailing_stop()
+                
+                # Проверяем время удержания позиции
                 if self.position_open_time:
                     hold_time = (self.get_local_time() - self.position_open_time).total_seconds()
+                    
+                    # Закрываем по максимальному времени удержания
                     if hold_time > self.strategy_config["max_position_hold_time"]:
                         logger.info("Закрытие по максимальному времени")
                         return self.close_position()
+                    
+                    # Закрываем по сигналу, если минимальное время прошло и позиция в прибыли
                     elif hold_time > self.strategy_config["min_position_hold_time"] and position.get("unrealised_pnl", 0) > 0:
-                        if position["side"] == "Buy" and trend == "downtrend" and momentum == "bearish_momentum" and abs(macd_hist) > self.strategy_config["strong_signal_threshold"]:
-                            logger.info("Закрытие Buy по сигналу")
-                            return self.close_position()
-                        elif position["side"] == "Sell" and trend == "uptrend" and momentum == "bullish_momentum" and abs(macd_hist) > self.strategy_config["strong_signal_threshold"]:
-                            logger.info("Закрытие Sell по сигналу")
-                            return self.close_position()
+                        # Используем более детальные условия для выхода
+                        if position["side"] == "Buy":
+                            if level in ["at_resistance", "near_resistance"] and rsi > 70:
+                                logger.info("Закрытие Buy по сигналу (достигнут уровень сопротивления)")
+                                return self.close_position()
+                        elif position["side"] == "Sell":
+                            if level in ["at_support", "near_support"] and rsi < 30:
+                                logger.info("Закрытие Sell по сигналу (достигнут уровень поддержки)")
+                                return self.close_position()
                 return False
-            buy_condition = (trend == "uptrend") and ((momentum == "bullish_momentum" and rsi < 70) or (level == "near_support" and rsi < 40))
-            sell_condition = (trend == "downtrend") and (
-                (momentum == "bearish_momentum" and rsi > 30) or 
-                (level == "near_resistance" and rsi > 60) or 
-                (level == "near_support" and rsi < 40)
-            )
+            
+            # Условия для входа в новую позицию
+            buy_condition = (level in ["at_support", "near_support"]) and (rsi < 30)
+            sell_condition = (level in ["at_resistance", "near_resistance"]) and (rsi > 70)
+            
+            # Открываем новую позицию, если нет открытых
             if position["size"] == 0:
                 position_size = self.calculate_position_size()
-                stop_loss_percent = self.strategy_config["stop_loss_percent"] / 100
+                stop_loss_percent = self.strategy_config["stop_loss_percent"] / 100  # 1.5%
                 take_profit_percent = self.strategy_config["take_profit_percent"] / 100
+                
                 if buy_condition:
-                    stop_loss = current_price * (1 - stop_loss_percent)
+                    # Устанавливаем стоп-лосс с учетом текущего уровня поддержки
+                    if level in ["at_support", "near_support"]:
+                        # Более агрессивный стоп за уровнем поддержки
+                        support = self.strategy_config.get("support_level", 0)
+                        stop_loss = min(current_price * (1 - stop_loss_percent), support * 0.99)
+                    else:
+                        stop_loss = current_price * (1 - stop_loss_percent)
+                        
                     take_profit = current_price * (1 + take_profit_percent)
-                    reason = f"Тренд={trend}, Импульс={momentum}, RSI={rsi:.2f}"
+                    reason = f"Уровень={level}, RSI={rsi:.2f}"
                     return self.place_order("Buy", position_size, stop_loss, take_profit, reason)
+                    
                 elif sell_condition:
-                    stop_loss = current_price * (1 + stop_loss_percent)
+                    # Устанавливаем стоп-лосс с учетом текущего уровня сопротивления
+                    if level in ["at_resistance", "near_resistance"]:
+                        # Более агрессивный стоп за уровнем сопротивления
+                        resistance = self.strategy_config.get("resistance_level", 0)
+                        stop_loss = max(current_price * (1 + stop_loss_percent), resistance * 1.01)
+                    else:
+                        stop_loss = current_price * (1 + stop_loss_percent)
+                        
                     take_profit = current_price * (1 - take_profit_percent)
-                    reason = f"Тренд={trend}, Импульс={momentum}, RSI={rsi:.2f}"
+                    reason = f"Уровень={level}, RSI={rsi:.2f}"
                     return self.place_order("Sell", position_size, stop_loss, take_profit, reason)
             return False
         except Exception as e:
             logger.error(f"Ошибка торговой логики: {str(e)}")
             return False
+    
+    def websocket_monitor(self):
+        """Мониторинг WebSocket."""
+        logger.info("Запущен мониторинг WebSocket")
+        while self.running:
+            time.sleep(60)
+            if not self.ws_connected or (self.ws_last_activity and (self.get_local_time() - self.ws_last_activity).total_seconds() > 300):
+                logger.warning("Переподключение WebSocket...")
+                if hasattr(self, 'ws_public') and self.ws_public: 
+                    self.ws_public.exit()
+                if hasattr(self, 'ws_private') and self.ws_private: 
+                    self.ws_private.exit()
+                self.ws_connected = False
+                self._initialize_websocket()
+            else:
+                logger.info(f"WebSocket активен: {self.ws_message_count} сообщений")
+    
+    def trading_loop(self, interval_seconds=2):
+        """Основной цикл торговли."""
+        logger.info("Запуск торгового цикла")
+        self.running = True
+        self.last_price_check = time.time()
+        self.last_rsi_update = time.time()
+        
+        try:
+            self.set_leverage()
+            self.fetch_kline_data()
+            self._initialize_websocket()
+            threading.Thread(target=self.websocket_monitor, daemon=True).start()
+            
+            while self.running:
+                # Проверяем цену через прямой REST API каждые 10 секунд
+                current_time = time.time()
+                if current_time - self.last_price_check > 10:
+                    direct_price = self.get_direct_ticker_price()
+                    if direct_price:
+                        logger.info(f"Текущая цена (прямой API): {direct_price:.4f}")
+                        
+                        # Обновляем RSI при каждом обновлении цены
+                        if self.strategy_config.get("rsi_real_time_update", True) and (current_time - self.last_rsi_update > 5):
+                            self._calculate_indicators()
+                            self.last_rsi_update = current_time
+                    
+                    self.last_price_check = current_time
+                    
+                self.trading_logic()
+                time.sleep(interval_seconds)
+        except KeyboardInterrupt:
+            logger.info("Остановлено пользователем")
+        finally:
+            self.running = False
+    
+    def start_trading(self, interval_seconds=2):
+        """Запуск торговли."""
+        if not self.running:
+            self.trading_thread = threading.Thread(target=self.trading_loop, args=(interval_seconds,), daemon=True)
+            self.trading_thread.start()
+            logger.info(f"Торговля запущена с интервалом {interval_seconds} сек")
+            return True
+        logger.warning("Торговля уже запущена")
+        return False
+    
+    def stop_trading(self):
+        """Остановка торговли."""
+        self.running = False
+        if self.trading_thread:
+            self.trading_thread.join(timeout=5)
+        if hasattr(self, 'ws_public') and self.ws_public: 
+            self.ws_public.exit()
+        if hasattr(self, 'ws_private') and self.ws_private: 
+            self.ws_private.exit()
+        self.ws_connected = False
+        logger.info("Торговля остановлена")
+        return True
 
 if __name__ == "__main__":
     api_key = "h0LWPVpDo9MHHb8InE"
     api_secret = "FsV1Dy7jezpYCTjUXpKuQaSQsgvfV4PnxNRf"
     trader = BybitTrader(api_key, api_secret, "ADAUSDT", test=False, leverage=2, position_size=8, timezone_offset=2)
-    trader.strategy_config["trailing_activation_percent"] = 0.1  # Активация при 0.1%
+    trader.strategy_config["trailing_activation_percent"] = 0.1  # Установка 0.1% для активации трейлинга
+    trader.strategy_config["stop_loss_percent"] = 1.5  # Установка стоп-лосса 1.5%
+    trader.strategy_config["use_direct_api"] = True  # Включение прямого API запроса для точных цен
+    trader.strategy_config["rsi_real_time_update"] = True  # Включение обновления RSI в реальном времени
     trader.start_trading()
     try:
         while trader.running:
